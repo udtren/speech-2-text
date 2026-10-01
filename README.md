@@ -1,41 +1,41 @@
 # Speech-2-Text
 
-ローカルで稼働している Qwen3-ASR を使って音声をテキストにし、そのまま編集できる思考整理向けのシンプルなエディター。
-Hermes Agent とは独立して動作します。
+A simple voice-input text editor for organizing your thoughts. It sends your speech to a locally running Qwen3-ASR server, inserts the transcript at the cursor, and lets you edit it freely.
+Runs independently of Hermes Agent.
 
-## 必要なもの
+## Requirements
 
-- Qwen3-ASR サーバー（`qwen-asr-serve`、既定 `http://localhost:8000/v1`）
-  - デスクトップの `Start-Qwen3-ASR.bat` で起動
+- A Qwen3-ASR server (`qwen-asr-serve`, default `http://localhost:8000/v1`)
+  - Start it with `Start-Qwen3-ASR.bat` on the desktop
 - Python 3.11+
 
-## 起動
+## Launch
 
-`run.bat` をダブルクリック（初回のみ `.venv` を作成して依存関係をインストール）。
+Double-click `run.bat`. On the first run it creates `.venv` and installs the dependencies.
 
-## 使い方
+## Usage
 
-| 操作 | キー |
+| Action | Key |
 |---|---|
-| 録音開始 / 停止 → カーソル位置に挿入 | **F9**（または「● 録音」ボタン） |
-| 新規 / 開く / 保存 / 名前を付けて保存 | Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S |
-| 文字サイズ変更 | Ctrl+マウスホイール |
+| Start / stop recording → insert transcript at the cursor | **F9** (or the "● 録音" button) |
+| New / Open / Save / Save As | Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S |
+| Change text size | Ctrl + mouse wheel |
 
-- **自動保存**: 保存済みのファイルは `autosave_seconds` ごとに上書き保存。無題の文書は `autosave/draft.md` に下書き保存され、次回起動時に復元されます。
-- 録音は WAV で直接 ASR サーバーへ送るため、Hermes 用の変換プロキシ（:8001）は不要です。
+- **Autosave**: a saved file is overwritten every `autosave_seconds`. An untitled document is saved as a draft to `autosave/draft.md` and restored on the next launch.
+- Recordings are sent as WAV directly to the ASR server, so the format-conversion proxy for Hermes (:8001) is not needed.
 
-## 設定 (`config.json`)
+## Settings (`config.json`)
 
-初回起動時に既定値で作成されます。変更後はアプリを再起動してください。
+Created with default values on first launch. Restart the app after changing it.
 
-| キー | 既定値 | 説明 |
+| Key | Default | Description |
 |---|---|---|
-| `server_url` | `http://localhost:8000/v1` | ASR サーバーの URL |
-| `model` | `Qwen/Qwen3-ASR-1.7B` | `qwen-asr-serve` に渡したモデル名 |
-| `language` | `""` | `""` = 自動判定、`"ja"` / `"en"` など ISO コード（`"Japanese"` は不可） |
-| `hotkey` | `F9` | 録音の開始 / 停止キー |
-| `autosave_seconds` | `30` | 自動保存の間隔（秒） |
-| `max_recording_seconds` | `600` | 1 回の録音の上限（秒） |
-| `request_timeout` | `120` | 文字起こしリクエストのタイムアウト（秒） |
-| `input_device` | `null` | マイク。`null` = 既定、番号またはデバイス名 |
-| `font_family` / `font_size` | `Yu Gothic UI` / `14` | エディターのフォント |
+| `server_url` | `http://localhost:8000/v1` | ASR server URL |
+| `model` | `Qwen/Qwen3-ASR-1.7B` | Model name passed to `qwen-asr-serve` |
+| `language` | `""` | `""` = auto-detect, or an ISO code such as `"ja"` / `"en"` (names like `"Japanese"` are rejected) |
+| `hotkey` | `F9` | Key to start / stop recording |
+| `autosave_seconds` | `30` | Autosave interval (seconds) |
+| `max_recording_seconds` | `600` | Maximum length of one recording (seconds) |
+| `request_timeout` | `120` | Transcription request timeout (seconds) |
+| `input_device` | `null` | Microphone. `null` = system default, or a device index / name |
+| `font_family` / `font_size` | `Yu Gothic UI` / `14` | Editor font |
