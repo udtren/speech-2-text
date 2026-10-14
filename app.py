@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -16,13 +18,14 @@ import httpx
 import numpy as np
 import sounddevice as sd
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QFont, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QCloseEvent, QFont, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QToolBar)
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 DRAFT_PATH = APP_DIR / "autosave" / "draft.md"
+FAILED_DIR = APP_DIR / "autosave" / "failed"
 
 DEFAULT_CONFIG = {
     "server_url": "http://localhost:8000/v1",
@@ -30,8 +33,9 @@ DEFAULT_CONFIG = {
     "language": "",            # "" = 自動判定, "ja" / "en" など ISO コード
     "hotkey": "F9",
     "autosave_seconds": 30,
-    "max_recording_seconds": 600,
-    "request_timeout": 120,
+    "max_recording_seconds": 3600,
+    "chunk_seconds": 120,      # 録音中、この長さごとに区切って順次文字起こしする
+    "request_timeout": 300,
     "input_device": None,      # None = 既定のマイク。番号かデバイス名
     "font_family": "Yu Gothic UI",
     "font_size": 14,
@@ -47,32 +51,88 @@ def load_config() -> dict:
     return config
 
 
+# Qwen3-ASR の生出力には "language Japanese<asr_text>" が付く。長い音声はサーバー側で
+# チャンク分割され、各チャンクにこのラベルが付いたまま連結されるので全箇所を除去する
+ASR_LABEL = re.compile(r"\s*(?:language\s+[A-Za-z]+\s*)?<asr_text>\s*")
+CJK = re.compile(r"[　-ヿ㐀-鿿＀-￯]")
+
+
 def strip_asr_prefix(text: str) -> str:
-    # Qwen3-ASR の生出力 "language Japanese<asr_text>..." から本文だけを取り出す
-    return text.split("<asr_text>", 1)[-1].strip()
+    def join(m: re.Match) -> str:
+        before = text[m.start() - 1] if m.start() > 0 else ""
+        after = text[m.end()] if m.end() < len(text) else ""
+        # 日本語同士の継ぎ目は詰め、英単語同士の継ぎ目には空白を残す
+        if not before or not after or CJK.match(before) or CJK.match(after):
+            return ""
+        return " "
+
+    return ASR_LABEL.sub(join, text).strip()
 
 
 # ---- Recording --------------------------------------------------------------
 
+def to_wav(pcm: np.ndarray, samplerate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(samplerate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
 class Recorder:
-    """マイク入力をメモリに貯め、停止時に WAV バイト列を返す."""
+    """マイク入力をメモリに貯め、区間ごと / 停止時に WAV バイト列を返す."""
+
+    # Qwen3-ASR は内部で 16 kHz に変換するので、録音時点で 16 kHz にしてサイズを抑える
+    TARGET_RATE = 16000
+    # 区間の切れ目を探す範囲（末尾から）と、音量を比べる単位
+    CUT_SEARCH_SECONDS = 5.0
+    CUT_FRAME_SECONDS = 0.1
 
     def __init__(self, device):
         self.device = device
         self.stream: sd.InputStream | None = None
         self.chunks: list[np.ndarray] = []
-        self.samplerate = 16000
+        self.lock = threading.Lock()
+        self.samplerate = self.TARGET_RATE
 
     def start(self):
-        info = sd.query_devices(self.device, kind="input")
-        self.samplerate = int(info["default_samplerate"])
+        try:
+            sd.check_input_settings(device=self.device, channels=1, samplerate=self.TARGET_RATE, dtype="int16")
+            self.samplerate = self.TARGET_RATE
+        except Exception:
+            self.samplerate = int(sd.query_devices(self.device, kind="input")["default_samplerate"])
         self.chunks = []
         self.stream = sd.InputStream(device=self.device, channels=1, samplerate=self.samplerate,
                                      dtype="int16", callback=self._callback)
         self.stream.start()
 
     def _callback(self, indata, frames, time_info, status):
-        self.chunks.append(indata.copy())
+        with self.lock:
+            self.chunks.append(indata[:, 0].copy())
+
+    def buffered_seconds(self) -> float:
+        with self.lock:
+            return sum(len(c) for c in self.chunks) / self.samplerate
+
+    def take_segment(self, seconds: float) -> bytes:
+        """先頭から約 seconds 秒を、その直前 5 秒で最も静かな位置で切り出す。残りは次の区間へ持ち越す."""
+        with self.lock:
+            pcm = np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.int16)
+            self.chunks = []
+        frame = int(self.samplerate * self.CUT_FRAME_SECONDS)
+        end = min(len(pcm), int(self.samplerate * seconds))
+        start = max(0, end - int(self.samplerate * self.CUT_SEARCH_SECONDS))
+        count = (end - start) // frame
+        cut = end
+        if count > 1:
+            window = pcm[start:start + count * frame].astype(np.float32).reshape(count, frame)
+            cut = start + int(np.argmin((window ** 2).mean(axis=1))) * frame + frame // 2
+        with self.lock:
+            # 切り出し中に届いた音声より前に、持ち越し分を戻す
+            self.chunks.insert(0, pcm[cut:])
+        return to_wav(pcm[:cut], self.samplerate)
 
     def stop(self) -> bytes | None:
         if self.stream is None:
@@ -80,30 +140,25 @@ class Recorder:
         self.stream.stop()
         self.stream.close()
         self.stream = None
-        if not self.chunks:
-            return None
-        pcm = np.concatenate(self.chunks).reshape(-1)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(self.samplerate)
-            w.writeframes(pcm.tobytes())
-        return buf.getvalue()
+        with self.lock:
+            pcm = np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.int16)
+            self.chunks = []
+        return to_wav(pcm, self.samplerate) if len(pcm) else None
 
 
 # ---- Transcription (background thread) --------------------------------------
 
 class TranscribeSignals(QObject):
-    done = Signal(str)
-    failed = Signal(str)
+    done = Signal(object, str)     # (job, text)
+    failed = Signal(object, str)   # (job, message)
 
 
 class TranscribeJob(QRunnable):
-    def __init__(self, wav: bytes, config: dict):
+    def __init__(self, wav: bytes, config: dict, final: bool = False):
         super().__init__()
         self.wav = wav
         self.config = config
+        self.final = final
         self.signals = TranscribeSignals()
 
     def run(self):
@@ -119,11 +174,11 @@ class TranscribeJob(QRunnable):
                     message = r.json()["error"]["message"]
                 except Exception:
                     message = r.text[:300]
-                self.signals.failed.emit(f"HTTP {r.status_code}: {message}")
+                self.signals.failed.emit(self, f"HTTP {r.status_code}: {message}")
                 return
-            self.signals.done.emit(strip_asr_prefix(r.json().get("text", "")))
+            self.signals.done.emit(self, strip_asr_prefix(r.json().get("text", "")))
         except httpx.HTTPError as exc:
-            self.signals.failed.emit(f"サーバーに接続できません: {exc}")
+            self.signals.failed.emit(self, f"サーバーに接続できません: {exc}")
 
 
 # ---- Main window ------------------------------------------------------------
@@ -133,7 +188,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.recorder = Recorder(config.get("input_device"))
-        self.pool = QThreadPool.globalInstance()
+        # 1 スレッドに限定して区間を録音順に文字起こしし、結果も順番どおりに届ける
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+        self.jobs: list[TranscribeJob] = []
         self.file_path: Path | None = None
         self.record_started = 0.0
         self.transcribing = False
@@ -210,6 +268,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "録音エラー", f"マイクを開けませんでした:\n{exc}")
             return
         self.record_started = time.monotonic()
+        # 録音開始時のカーソル位置に区間ごとの結果を順に挿入する。QTextCursor は
+        # ユーザーが録音中に他の場所を編集しても位置が追従する
+        self.insert_cursor = QTextCursor(self.editor.textCursor())
+        self.inserted_chars = 0
+        self.last_char = ""
+        self.segments_sent = 0
+        self.segments_done = 0
+        self.failures: list[str] = []
         self.record_btn.setText(f"■ 停止 ({self.config['hotkey']})")
         self.record_btn.setStyleSheet("background:#c0392b; color:white; font-weight:bold;")
         self.tick.start()
@@ -219,48 +285,102 @@ class MainWindow(QMainWindow):
         self.tick.stop()
         wav = self.recorder.stop()
         self.record_btn.setStyleSheet("")
-        if not wav or time.monotonic() - self.record_started < 0.3:
+        if self.segments_sent == 0 and (not wav or time.monotonic() - self.record_started < 0.3):
             self._reset_record_button()
             self._set_status("録音が短すぎます")
             return
         self.transcribing = True
-        self.record_btn.setText("文字起こし中…")
         self.record_btn.setEnabled(False)
-        self._set_status("文字起こし中…", "#2471a3")
-        job = TranscribeJob(wav, self.config)
-        job.signals.done.connect(self._on_transcript)
-        job.signals.failed.connect(self._on_transcribe_failed)
+        if wav:
+            self._submit_segment(wav, final=True)
+        else:
+            self._finish_session()
+        self._show_progress()
+
+    def _submit_segment(self, wav: bytes, final: bool = False):
+        self.segments_sent += 1
+        job = TranscribeJob(wav, self.config, final)
+        # 結果が届くまで参照を保持する（自動削除させるとシグナルが失われることがある）
+        job.setAutoDelete(False)
+        self.jobs.append(job)
+        # ウィンドウのメソッドに接続し、結果をメインスレッドで受け取る
+        job.signals.done.connect(self._on_segment)
+        job.signals.failed.connect(self._on_segment_failed)
         self.pool.start(job)
+
+    def _show_progress(self):
+        progress = f"{self.segments_done}/{self.segments_sent}"
+        if self.recorder.stream is None:
+            self.record_btn.setText(f"文字起こし中… ({progress})")
+            self._set_status(f"文字起こし中… 区間 {progress}", "#2471a3")
 
     def _on_tick(self):
         elapsed = time.monotonic() - self.record_started
-        self._set_status(f"● 録音中 {int(elapsed // 60)}:{int(elapsed % 60):02d}", "#c0392b")
+        status = f"● 録音中 {int(elapsed // 60)}:{int(elapsed % 60):02d}"
+        if self.segments_sent:
+            status += f" — 区間 {self.segments_done}/{self.segments_sent} 文字起こし済み"
+        self._set_status(status, "#c0392b")
         if elapsed >= self.config["max_recording_seconds"]:
             self._stop_recording()
+        elif self.recorder.buffered_seconds() >= self.config["chunk_seconds"]:
+            self._submit_segment(self.recorder.take_segment(self.config["chunk_seconds"]))
 
     def _reset_record_button(self):
         self.transcribing = False
         self.record_btn.setEnabled(True)
         self.record_btn.setText(f"● 録音 ({self.config['hotkey']})")
 
-    def _on_transcript(self, text: str):
-        self._reset_record_button()
-        if not text:
-            self._set_status("音声を検出できませんでした")
-            return
-        cursor = self.editor.textCursor()
-        # 行の途中なら改行してから挿入し、挿入後も改行して次の入力に備える
-        if cursor.positionInBlock() > 0:
-            text = "\n" + text
-        cursor.insertText(text + "\n")
-        self.editor.setTextCursor(cursor)
-        self.editor.ensureCursorVisible()
-        self.editor.setFocus()
-        self._set_status(f"挿入しました ({len(text.strip())} 文字)")
+    def _insert_segment(self, text: str):
+        cursor = self.insert_cursor
+        if not self.inserted_chars:
+            # 行の途中なら改行してから挿入する
+            if cursor.positionInBlock() > 0:
+                text = "\n" + text
+        elif not (CJK.match(self.last_char) or CJK.match(text[0])):
+            # 英単語同士の継ぎ目だけ空白でつなぐ
+            text = " " + text
+        cursor.insertText(text)
+        self.inserted_chars += len(text.strip())
+        self.last_char = text[-1]
 
-    def _on_transcribe_failed(self, message: str):
+    def _on_segment(self, job: TranscribeJob, text: str):
+        self.jobs.remove(job)
+        self.segments_done += 1
+        if text:
+            self._insert_segment(text)
+        if job.final:
+            self._finish_session()
+        else:
+            self._show_progress()
+
+    def _on_segment_failed(self, job: TranscribeJob, message: str):
+        self.jobs.remove(job)
+        self.segments_done += 1
+        # 失敗した区間の音声は捨てずに保存しておく
+        FAILED_DIR.mkdir(parents=True, exist_ok=True)
+        path = FAILED_DIR / time.strftime(f"%Y%m%d-%H%M%S-{self.segments_done}.wav")
+        path.write_bytes(job.wav)
+        self.failures.append(f"{message}（音声: {path}）")
+        if job.final:
+            self._finish_session()
+        else:
+            self._show_progress()
+
+    def _finish_session(self):
         self._reset_record_button()
-        self._set_status(f"⚠ 文字起こし失敗: {message}", "#c0392b")
+        if self.inserted_chars:
+            # 挿入後に改行して次の入力に備える
+            self.insert_cursor.insertText("\n")
+            self.editor.setTextCursor(self.insert_cursor)
+            self.editor.ensureCursorVisible()
+            self.editor.setFocus()
+        if self.failures:
+            self._set_status(f"⚠ {len(self.failures)}/{self.segments_sent} 区間の文字起こし失敗: "
+                             f"{self.failures[-1]}", "#c0392b")
+        elif self.inserted_chars:
+            self._set_status(f"挿入しました ({self.inserted_chars} 文字, {self.segments_sent} 区間)")
+        else:
+            self._set_status("音声を検出できませんでした")
 
     # -- Files ------------------------------------------------------------
     def _confirm_discard(self) -> bool:
